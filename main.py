@@ -6,8 +6,9 @@ from discord import app_commands
 from dotenv import load_dotenv
 from gtts import gTTS
 import re
-
+from pyt2s.services import stream_elements
 import asyncio
+from datetime import timedelta
 
 load_dotenv()
 token = os.getenv('DISCORD_TOKEN')
@@ -37,27 +38,31 @@ async def on_ready():
 
 @bot.event
 async def on_message(message):
-    # prevents infinite loop of bot responding to itself
-    if message.author == bot.user:
+    # prevents infinite loop of bot responding to itself,
+    # accounts for if slash command is used (message becomes None)
+    if message.author == bot.user or message is None:
         return
 
     vc = message.guild.voice_client
 
     if vc is not None:
-        await generate_audio(vc, message)
+        await generate_audio(vc, message, "")
 
     await bot.process_commands(message)
 
-async def generate_audio(vc, message):
+async def generate_audio(vc, message, voice):
     # if the bot is already playing a sound, cancel it
-    if vc.is_playing():
-        vc.stop()
+    #if vc.is_playing():
+    #    vc.stop()
 
     # create sound file from text
-    text = await fix_text(message)
+    text = await prep_text(message)
     print(text)
-    sound = gTTS(text=text, lang='en')
-    sound.save("tts-audio.mp3")
+    #sound = gTTS(text=text, lang='en-in')
+    #sound.save("tts-audio.mp3")
+    sound = stream_elements.requestTTS(text)
+    with open("tts-audio.mp3", '+wb') as file:
+        file.write(sound)
 
     # if the text is empty, don't play the audio
     if text.isspace():
@@ -65,7 +70,7 @@ async def generate_audio(vc, message):
 
     vc.play(discord.FFmpegPCMAudio(executable="C:/ffmpeg/bin/ffmpeg.exe", source="tts-audio.mp3"))
 
-async def fix_text(message):
+async def prep_text(message):
     text = message.content
 
     # turns the long string of numbers from a mention into the actual display name
@@ -75,6 +80,23 @@ async def fix_text(message):
 
     # removes urls
     text = re.sub(r'https?://\S+', '', text)
+
+    # if previous message is sent by a different user, address the new user
+    async for msg in message.channel.history(limit=2):
+        if msg.id != message.id: # skips the first message
+            text = await address_text(text, message, msg)
+
+    return text
+
+async def address_text(text, curr_msg, prev_msg):
+    time_difference = curr_msg.created_at - prev_msg.created_at
+
+    print(f"Time diff: {time_difference}")
+
+    print(f"before curr check: {text}")
+    # if a new user sends a message or if enough time has passed, address the user.
+    if curr_msg.author != prev_msg.author or time_difference > timedelta(seconds=30):
+        return f"{curr_msg.author.display_name} says, {text}"
 
     return text
 
