@@ -5,6 +5,7 @@ from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
 from gtts import gTTS
+import re
 
 import asyncio
 
@@ -53,7 +54,8 @@ async def generate_audio(vc, message):
         vc.stop()
 
     # create sound file from text
-    text = message.content
+    text = await fix_text(message)
+    print(text)
     sound = gTTS(text=text, lang='en')
     sound.save("tts-audio.mp3")
 
@@ -62,6 +64,14 @@ async def generate_audio(vc, message):
         return
 
     vc.play(discord.FFmpegPCMAudio(executable="C:/ffmpeg/bin/ffmpeg.exe", source="tts-audio.mp3"))
+
+async def fix_text(message):
+    text = message.content
+    # turns the long string of numbers from a mention into the actual display name
+    for user in message.mentions:
+        mention_pattern = f"<@!?{user.id}>"
+        text = re.sub(mention_pattern, f"@ {user.display_name}", text)
+    return text
 
 @bot.command(name="start")
 async def start(ctx):
