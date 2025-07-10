@@ -67,10 +67,15 @@ async def generate_audio(vc, message):
 
 async def fix_text(message):
     text = message.content
+
     # turns the long string of numbers from a mention into the actual display name
     for user in message.mentions:
         mention_pattern = f"<@!?{user.id}>"
         text = re.sub(mention_pattern, f"@ {user.display_name}", text)
+
+    # removes urls
+    text = re.sub(r'https?://\S+', '', text)
+
     return text
 
 @bot.command(name="start")
