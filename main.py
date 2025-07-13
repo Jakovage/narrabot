@@ -1,19 +1,18 @@
-import os
+import os, re, uuid, glob
 import discord
 import logging
+import asyncio
+
 from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
-from gtts import gTTS
-import re
 from pyt2s.services import stream_elements
-import asyncio
 from datetime import timedelta
 
 load_dotenv()
 token = os.getenv('DISCORD_TOKEN')
 
-handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w')
+handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w') # generates log file for each run
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -22,6 +21,12 @@ intents.members = True
 GUILD_ID = discord.Object(id=823035947083890709)
 
 bot = commands.Bot(command_prefix='!', intents=intents)
+
+message_queue = asyncio.Queue()
+playback_task = None
+in_generate_audio = False
+
+commands_as_strs = ["!start", "!stop", "!voice",]
 
 @bot.event
 async def on_ready():
@@ -45,30 +50,53 @@ async def on_message(message):
 
     vc = message.guild.voice_client
 
-    if vc is not None:
-        await generate_audio(vc, message, "")
+    msg_is_command = message.content in commands_as_strs
+
+    if vc is not None and not msg_is_command:
+        if message_queue.empty():
+            await message_queue.put((vc, message, ""))
+            asyncio.create_task(process_audio_queue())
+        else:
+            await message_queue.put((vc, message, ""))
 
     await bot.process_commands(message)
 
-async def generate_audio(vc, message, voice):
-    # if the bot is already playing a sound, cancel it
-    #if vc.is_playing():
-    #    vc.stop()
+async def process_audio_queue():
+    while not message_queue.empty():
+        message_obj = message_queue._queue[0]
+        await generate_audio(message_obj[0], message_obj[1], message_obj[2])
+        await message_queue.get()
 
+async def generate_audio(vc, message, voice):
     # create sound file from text
+    global in_generate_audio
+    in_generate_audio = True
     text = await prep_text(message)
-    print(text)
-    #sound = gTTS(text=text, lang='en-in')
-    #sound.save("tts-audio.mp3")
     sound = stream_elements.requestTTS(text)
-    with open("tts-audio.mp3", '+wb') as file:
-        file.write(sound)
 
     # if the text is empty, don't play the audio
     if text.isspace():
         return
 
-    vc.play(discord.FFmpegPCMAudio(executable="C:/ffmpeg/bin/ffmpeg.exe", source="tts-audio.mp3"))
+    filename = f"tts-{uuid.uuid4()}.mp3"
+    with open(filename, '+wb') as file:
+        file.write(sound)
+
+    #waits until nothing is playing, just to be safe
+    while vc.is_playing():
+        await asyncio.sleep(.2)
+
+    try:
+        vc.play(discord.FFmpegPCMAudio(executable="C:/ffmpeg/bin/ffmpeg.exe", source=filename))
+    except FileNotFoundError as e:
+        print(f"Error with audio file: {e}")
+
+    # waits until playback ends
+    while vc.is_playing():
+        await asyncio.sleep(.2)
+
+    os.remove(filename)
+
 
 async def prep_text(message):
     text = message.content
@@ -91,14 +119,24 @@ async def prep_text(message):
 async def address_text(text, curr_msg, prev_msg):
     time_difference = curr_msg.created_at - prev_msg.created_at
 
-    print(f"Time diff: {time_difference}")
-
-    print(f"before curr check: {text}")
     # if a new user sends a message or if enough time has passed, address the user.
     if curr_msg.author != prev_msg.author or time_difference > timedelta(seconds=30):
         return f"{curr_msg.author.display_name} says, {text}"
 
     return text
+
+async def queue_to_string():
+    q_str = ''
+    if message_queue.empty():
+        return q_str
+    else:
+        q_str += "Current queue contents:"
+        for idx, item in enumerate(list(message_queue._queue)):
+            q_str += f"{idx + 1}: message -> {item[1].content}\n"
+
+@bot.command(name="print_queue")
+async def print_queue(ctx):
+    print(await queue_to_string())
 
 @bot.command(name="start")
 async def start(ctx):
@@ -123,6 +161,17 @@ async def start(ctx):
 
 @bot.command(name="stop")
 async def stop(ctx):
+    if ctx.voice_client is None:
+        await ctx.send("I am already stopped!")
+
+    vc = ctx.voice_client
+
+    message_queue._queue.clear() # clear queue
+
+    # waits for current message to finish playing before disconnecting it
+    while vc.is_playing():
+        await asyncio.sleep(.2)
+
     if ctx.voice_client is not None:
         await ctx.voice_client.disconnect()
 
@@ -133,7 +182,6 @@ async def join(interaction: discord.Interaction):
     voice_channel = user.voice.channel
 
     if voice_channel is None:
-        print("bro aint in a vc")
         await user.send("Please enter a vc.")
         return
 
