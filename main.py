@@ -4,7 +4,7 @@ import logging
 import asyncio
 
 from discord.ext import commands
-from discord import app_commands
+from discord import app_commands, ClientException
 from dotenv import load_dotenv
 from pyt2s.services import stream_elements
 from datetime import timedelta
@@ -22,11 +22,9 @@ GUILD_ID = discord.Object(id=823035947083890709)
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
+# these are things i'm going to have to change when adding to multiple servers.
 message_queue = asyncio.Queue()
-playback_task = None
-in_generate_audio = False
-
-commands_as_strs = ["!start", "!stop", "!voice",]
+current_channel = None
 
 @bot.event
 async def on_ready():
@@ -37,7 +35,6 @@ async def on_ready():
         guild = discord.Object(id=823035947083890709)
         synced = await bot.tree.sync(guild=guild)
         print(f"Synced {len(synced)} command(s) to guild {guild.id}")
-
     except Exception as e:
         print(f"Error syncing commands: {e}")
 
@@ -50,9 +47,11 @@ async def on_message(message):
 
     vc = message.guild.voice_client
 
-    msg_is_command = message.content in commands_as_strs
+    is_right_channel = current_channel == message.channel
 
-    if vc is not None and not msg_is_command:
+    # if the queue is empty and a message is sent, send it to the queue and begin processing it
+    # otherwise, send a consecutive message to the queue (where it will get processed)
+    if vc is not None and is_right_channel:
         if message_queue.empty():
             await message_queue.put((vc, message, ""))
             asyncio.create_task(process_audio_queue())
@@ -60,6 +59,75 @@ async def on_message(message):
             await message_queue.put((vc, message, ""))
 
     await bot.process_commands(message)
+
+@bot.tree.command(name="start", description="Joins the voice channel your in and automatically starts narrating!", guild=GUILD_ID)
+async def start(interaction: discord.Interaction):
+    user = interaction.user
+
+    user_vc = user.voice.channel
+    bot_vc = interaction.guild.voice_client
+
+    # if user is not in voice chat, do nothing
+
+    global current_channel
+
+    if user.voice is None:
+        await interaction.response.send_message("please join a voice channel")
+
+    elif bot_vc is None:
+        await user_vc.connect()
+        await interaction.response.send_message(
+            f"Starting narration of text channel: {interaction.channel.name}"
+        )
+
+    elif interaction.channel != current_channel and bot_vc.channel != user_vc:
+        await interaction.response.send_message(
+            f"Changing narration to text channel: {interaction.channel.name}\n"
+            f"moving Narrabot to voice channel: {user_vc.name}"
+        )
+        await bot_vc.move_to(user_vc)
+
+    elif interaction.channel != current_channel:
+        await interaction.response.send_message(
+            f"Changing narration to text channel: {interaction.channel.name}\n"
+        )
+
+    elif bot_vc.channel != user_vc:
+        await interaction.response.send_message(
+            f"Moving NarraBot to voice channel: {user_vc.name}"
+        )
+        await bot_vc.move_to(user_vc)
+
+    else: # user_vc == bot_vc.channel and text channel unchanged
+        await interaction.response.send_message(
+            f"Already narrating: {interaction.channel.name}"
+        )
+
+    current_channel = interaction.channel
+
+@bot.tree.command(name="stop", description="Stop narration and leave voice channel", guild=GUILD_ID)
+async def stop(interaction: discord.Interaction):
+    vc = interaction.guild.voice_client
+    await interaction.response.send_message("Stopping narration and leaving voice channel.")
+
+    if vc is None:
+        await interaction.response.send_message("I am already stopped!")
+
+    message_queue._queue.clear()
+
+    # waits for current message to finish playing before disconnecting it
+    while vc.is_playing():
+        await asyncio.sleep(.2)
+
+    await asyncio.sleep(1)
+
+    await delete_all_mp3()
+
+    if vc is not None:
+        await vc.disconnect()
+
+    global current_channel
+    current_channel = None
 
 async def process_audio_queue():
     while not message_queue.empty():
@@ -69,8 +137,6 @@ async def process_audio_queue():
 
 async def generate_audio(vc, message, voice):
     # create sound file from text
-    global in_generate_audio
-    in_generate_audio = True
     text = await prep_text(message)
     sound = stream_elements.requestTTS(text)
 
@@ -90,13 +156,17 @@ async def generate_audio(vc, message, voice):
         vc.play(discord.FFmpegPCMAudio(executable="C:/ffmpeg/bin/ffmpeg.exe", source=filename))
     except FileNotFoundError as e:
         print(f"Error with audio file: {e}")
+    except ClientException as e:
+        print(f"Error with playing audio. likely caused by spam. Error: {e}")
 
     # waits until playback ends
     while vc.is_playing():
         await asyncio.sleep(.2)
 
-    os.remove(filename)
-
+    try:
+        os.remove(filename)
+    except OSError as e:
+        print(f"Something went wrong while deleting temporary file. Likely caused by spam. Error: {e}")
 
 async def prep_text(message):
     text = message.content
@@ -107,7 +177,7 @@ async def prep_text(message):
         text = re.sub(mention_pattern, f"@ {user.display_name}", text)
 
     # removes urls
-    text = re.sub(r'https?://\S+', '', text)
+    text = re.sub(r'https?://\S+', 'Link', text)
 
     # if previous message is sent by a different user, address the new user
     async for msg in message.channel.history(limit=2):
@@ -125,68 +195,12 @@ async def address_text(text, curr_msg, prev_msg):
 
     return text
 
-async def queue_to_string():
-    q_str = ''
-    if message_queue.empty():
-        return q_str
-    else:
-        q_str += "Current queue contents:"
-        for idx, item in enumerate(list(message_queue._queue)):
-            q_str += f"{idx + 1}: message -> {item[1].content}\n"
-
-@bot.command(name="print_queue")
-async def print_queue(ctx):
-    print(await queue_to_string())
-
-@bot.command(name="start")
-async def start(ctx):
-    user = ctx.author
-
-    # if user is not in voice chat, do nothing
-    if user.voice is None:
-        await ctx.send("please join a vc")
-        return
-
-    voice_channel = user.voice.channel
-
-    # reuse existing voice client if already connected
-    vc = ctx.voice_client
-
-    # if bot hasn't joined a vc yet, join the user's vc.
-    # if the bot is in a vc but not the same as the calling user, move calls.
-    if vc is None:
-        vc = await voice_channel.connect()
-    elif vc.channel != voice_channel:
-        await vc.move_to(voice_channel)
-
-@bot.command(name="stop")
-async def stop(ctx):
-    if ctx.voice_client is None:
-        await ctx.send("I am already stopped!")
-
-    vc = ctx.voice_client
-
-    message_queue._queue.clear() # clear queue
-
-    # waits for current message to finish playing before disconnecting it
-    while vc.is_playing():
-        await asyncio.sleep(.2)
-
-    if ctx.voice_client is not None:
-        await ctx.voice_client.disconnect()
-
-@bot.tree.command(name="join", description="uhh", guild=GUILD_ID)
-async def join(interaction: discord.Interaction):
-    user = interaction.user
-
-    voice_channel = user.voice.channel
-
-    if voice_channel is None:
-        await user.send("Please enter a vc.")
-        return
-
-@bot.tree.command(name="test", description="test i guess", guild=GUILD_ID)
-async def test(interaction: discord.Interaction):
-    await interaction.response.send_message("test message")
+# removes any temporary audio files in case one is somehow missed
+async def delete_all_mp3():
+    for file in glob.glob("*.mp3"):
+        try:
+            os.remove(file)
+        except OSError:
+            print("Something went wrong while clearing all leftover temporary audio files. Likely caused by spam.")
 
 bot.run(token, log_handler=handler, log_level=logging.DEBUG)
