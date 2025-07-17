@@ -25,6 +25,12 @@ bot = commands.Bot(command_prefix='!', intents=intents)
 # these are things i'm going to have to change when adding to multiple servers.
 message_queue = asyncio.Queue()
 current_channel = None
+# list of all voices
+voice_choices = [
+    app_commands.Choice(name=voice.name, value=voice.value)
+    for voice in list(stream_elements.Voice)[1:25]
+]
+active_voice = "Brian" # an arbitrarily chosen default voice
 
 @bot.event
 async def on_ready():
@@ -53,10 +59,10 @@ async def on_message(message):
     # otherwise, send a consecutive message to the queue (where it will get processed)
     if vc is not None and is_right_channel:
         if message_queue.empty():
-            await message_queue.put((vc, message, ""))
+            await message_queue.put((vc, message, active_voice))
             asyncio.create_task(process_audio_queue())
         else:
-            await message_queue.put((vc, message, ""))
+            await message_queue.put((vc, message, active_voice))
 
     await bot.process_commands(message)
 
@@ -129,6 +135,14 @@ async def stop(interaction: discord.Interaction):
     global current_channel
     current_channel = None
 
+@bot.tree.command(name="voice", description="Change the voice of NarraBot", guild=GUILD_ID)
+@app_commands.describe(voice="Choose the new voice")
+@app_commands.choices(voice=voice_choices)
+async def voice(interaction: discord.Interaction, voice: app_commands.Choice[str]):
+    global active_voice
+    active_voice = voice.value
+    await interaction.response.send_message(f"Voice changed to {voice.name}")
+
 async def process_audio_queue():
     while not message_queue.empty():
         message_obj = message_queue._queue[0]
@@ -138,7 +152,7 @@ async def process_audio_queue():
 async def generate_audio(vc, message, voice):
     # create sound file from text
     text = await prep_text(message)
-    sound = stream_elements.requestTTS(text)
+    sound = stream_elements.requestTTS(text, voice)
 
     # if the text is empty, don't play the audio
     if text.isspace():
