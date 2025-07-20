@@ -1,11 +1,11 @@
-#python
+# python
 __pycache__/
 *.py[cod]
 *.log
 *.env
-*.mp3
+*.json
 
-# Environments
+# environments
 venv/
 .venv/
 
@@ -16,3 +16,7 @@ venv/
 # OS junk
 .DS_Store
 Thumbs.db
+
+# other stuff
+assets/
+guild_audio/

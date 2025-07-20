@@ -1,36 +1,62 @@
-import os, re, uuid, glob
+import os, re, uuid, glob, json
+from os import mkdir
+
 import discord
 import logging
 import asyncio
+import voices
 
 from discord.ext import commands
 from discord import app_commands, ClientException
 from dotenv import load_dotenv
 from pyt2s.services import stream_elements
 from datetime import timedelta
+from guild_state import Guild, AudioTask
+from pathlib import Path
+from storage import save_guilds, load_guilds
 
 load_dotenv()
 token = os.getenv('DISCORD_TOKEN')
 
 handler = logging.FileHandler(filename='discord.log', encoding='utf-8', mode='w') # generates log file for each run
 
+ROOT_DIR = Path(__file__).resolve().parent # narrabot/
+AUDIO_DIR = ROOT_DIR / 'guild_audio' # narrabot/guild_audio
+STATE_FILE = Path("guild_config.json")
+FFMPEG_DIR = "C:/ffmpeg/bin/ffmpeg.exe"
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-GUILD_ID = discord.Object(id=823035947083890709)
+guilds = load_guilds() # {guild_id : Guild Object}, loads guild objects from
+
+DEFAULT_VOICE = "Joanna"
+voice_choices = [
+    app_commands.Choice(name=voice.name, value=voice.value)
+    for voice in voices.Voice
+]
 
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# these are things i'm going to have to change when adding to multiple servers.
-message_queue = asyncio.Queue()
-current_channel = None
-# list of all voices
-voice_choices = [
-    app_commands.Choice(name=voice.name, value=voice.value)
-    for voice in list(stream_elements.Voice)[1:25]
-]
-active_voice = "Brian" # an arbitrarily chosen default voice
+@bot.event
+async def on_guild_join(guild):
+    guilds[guild.id] = Guild(guild.id, asyncio.Queue(), None, DEFAULT_VOICE)
+    save_guilds(guilds)
+    mkdir(guild_audio_dir(guild.id))
+
+@bot.event
+async def on_guild_remove(guild):
+    del guilds[guild.id]
+    save_guilds(guilds)
+    try:
+        os.rmdir(guild_audio_dir(guild.id))
+        print(f"removed audio directory: {guild_audio_dir(guild.id)}")
+    except OSError:
+        print(f"Error with deleting audio directory upon removal of NarraBot of guild {guild_audio_dir(guild.id)}")
+
+def guild_audio_dir(guild_id: int) -> Path:
+    return AUDIO_DIR / str(guild_id)
 
 @bot.event
 async def on_ready():
@@ -38,35 +64,36 @@ async def on_ready():
 
     # syncs slash commands with discord
     try:
-        guild = discord.Object(id=823035947083890709)
-        synced = await bot.tree.sync(guild=guild)
-        print(f"Synced {len(synced)} command(s) to guild {guild.id}")
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} global commands")
     except Exception as e:
         print(f"Error syncing commands: {e}")
 
 @bot.event
 async def on_message(message):
-    # prevents infinite loop of bot responding to itself,
-    # accounts for if slash command is used (message becomes None)
+    # prevents infinite loop of bot responding to itself
     if message.author == bot.user or message is None:
         return
 
-    vc = message.guild.voice_client
+    bot_vc = message.guild.voice_client
 
-    is_right_channel = current_channel == message.channel
+    guild = guilds[message.guild.id]
+    audio_task = AudioTask(bot_vc, message)
+
+    is_right_channel = guild.curr_channel == message.channel
 
     # if the queue is empty and a message is sent, send it to the queue and begin processing it
     # otherwise, send a consecutive message to the queue (where it will get processed)
-    if vc is not None and is_right_channel:
-        if message_queue.empty():
-            await message_queue.put((vc, message, active_voice))
-            asyncio.create_task(process_audio_queue())
+    if bot_vc is not None and is_right_channel:
+        if guild.message_queue.empty():
+            await guild.message_queue.put(audio_task)
+            asyncio.create_task(process_audio_queue(guild))
         else:
-            await message_queue.put((vc, message, active_voice))
+            await guild.message_queue.put(audio_task)
 
     await bot.process_commands(message)
 
-@bot.tree.command(name="start", description="Joins the voice channel your in and automatically starts narrating!", guild=GUILD_ID)
+@bot.tree.command(name="start", description="Joins the voice channel your in and automatically starts narrating!")
 async def start(interaction: discord.Interaction):
     user = interaction.user
 
@@ -74,82 +101,87 @@ async def start(interaction: discord.Interaction):
     bot_vc = interaction.guild.voice_client
 
     # if user is not in voice chat, do nothing
+    current_text_channel = guilds[interaction.guild.id].curr_channel
 
-    global current_channel
-
+    # won't start NarraBot if user isn't in a vc
     if user.voice is None:
         await interaction.response.send_message("please join a voice channel")
 
+    # if bot hasn't been started, join the user's vc and narrate the next channel it was called from
     elif bot_vc is None:
         await user_vc.connect()
         await interaction.response.send_message(
             f"Starting narration of text channel: {interaction.channel.name}"
         )
 
-    elif interaction.channel != current_channel and bot_vc.channel != user_vc:
+    # if bot is actively narrating user calls start from a different text channel and different vc
+    elif interaction.channel != current_text_channel and bot_vc.channel != user_vc:
         await interaction.response.send_message(
             f"Changing narration to text channel: {interaction.channel.name}\n"
             f"moving Narrabot to voice channel: {user_vc.name}"
         )
         await bot_vc.move_to(user_vc)
 
-    elif interaction.channel != current_channel:
+    # if bot is actively narrating and user calls start from a different text channel
+    elif interaction.channel != current_text_channel:
         await interaction.response.send_message(
             f"Changing narration to text channel: {interaction.channel.name}\n"
         )
 
+    # if bot is actively narrating and user calls from a different vc
     elif bot_vc.channel != user_vc:
         await interaction.response.send_message(
             f"Moving NarraBot to voice channel: {user_vc.name}"
         )
         await bot_vc.move_to(user_vc)
 
-    else: # user_vc == bot_vc.channel and text channel unchanged
+    # user_vc == bot_vc.channel and text channel unchanged
+    else:
         await interaction.response.send_message(
             f"Already narrating: {interaction.channel.name}"
         )
 
-    current_channel = interaction.channel
+    # updating the guild object's "current channel" to be the text channel it was
+    guilds[interaction.guild.id].curr_channel = interaction.channel
 
-@bot.tree.command(name="stop", description="Stop narration and leave voice channel", guild=GUILD_ID)
+@bot.tree.command(name="stop", description="Stop narration and leave voice channel")
 async def stop(interaction: discord.Interaction):
-    vc = interaction.guild.voice_client
+    bot_vc = interaction.guild.voice_client
     await interaction.response.send_message("Stopping narration and leaving voice channel.")
 
-    if vc is None:
+    if bot_vc is None:
         await interaction.response.send_message("I am already stopped!")
 
-    message_queue._queue.clear()
+    guilds[interaction.guild.id].message_queue._queue.clear() # clears the guild's audio queue, preventing it from finishing
 
     # waits for current message to finish playing before disconnecting it
-    while vc.is_playing():
+    while bot_vc.is_playing():
         await asyncio.sleep(.2)
 
-    await asyncio.sleep(1)
+    await asyncio.sleep(1) # extra second before deleting all mp3 in case there's some sort of latency
 
+    # cleans any remaining mp3 files. if there ARE any remaining, it is due to an error (likely due to spam)
     await delete_all_mp3()
 
-    if vc is not None:
-        await vc.disconnect()
+    if bot_vc is not None:
+        await bot_vc.disconnect()
 
-    global current_channel
-    current_channel = None
+    guilds[interaction.guild.id].curr_channel = None
 
-@bot.tree.command(name="voice", description="Change the voice of NarraBot", guild=GUILD_ID)
+@bot.tree.command(name="voice", description="Change the voice of NarraBot")
 @app_commands.describe(voice="Choose the new voice")
 @app_commands.choices(voice=voice_choices)
 async def voice(interaction: discord.Interaction, voice: app_commands.Choice[str]):
-    global active_voice
-    active_voice = voice.value
+    guilds[interaction.guild.id].curr_voice = voice.value
     await interaction.response.send_message(f"Voice changed to {voice.name}")
 
-async def process_audio_queue():
-    while not message_queue.empty():
-        message_obj = message_queue._queue[0]
-        await generate_audio(message_obj[0], message_obj[1], message_obj[2])
-        await message_queue.get()
+async def process_audio_queue(guild):
+    while not guild.message_queue.empty():
+        audio_task = guild.message_queue._queue[0] # equivalent to a peek() operation to get the next audio task
+        await generate_audio(audio_task.bot_vc, audio_task.message, guild.curr_voice)
+        await guild.message_queue.get() # removes the audio message object from the queue, then goes to the next one
 
-async def generate_audio(vc, message, voice):
+async def generate_audio(bot_vc, message, voice):
     # create sound file from text
     text = await prep_text(message)
     sound = stream_elements.requestTTS(text, voice)
@@ -158,23 +190,26 @@ async def generate_audio(vc, message, voice):
     if text.isspace():
         return
 
-    filename = f"tts-{uuid.uuid4()}.mp3"
+    # file: /narrabot/guild_audio/(guild_id)/tts-uuid.mp3
+    filename = AUDIO_DIR / str(message.guild.id) / f"tts-{uuid.uuid4()}.mp3"
     with open(filename, '+wb') as file:
         file.write(sound)
 
-    #waits until nothing is playing, just to be safe
-    while vc.is_playing():
+    print(filename)
+
+    # waits until nothing is playing, just to be safe
+    while bot_vc.is_playing():
         await asyncio.sleep(.2)
 
     try:
-        vc.play(discord.FFmpegPCMAudio(executable="C:/ffmpeg/bin/ffmpeg.exe", source=filename))
+        bot_vc.play(discord.FFmpegPCMAudio(executable=FFMPEG_DIR, source=filename))
     except FileNotFoundError as e:
         print(f"Error with audio file: {e}")
     except ClientException as e:
         print(f"Error with playing audio. likely caused by spam. Error: {e}")
 
     # waits until playback ends
-    while vc.is_playing():
+    while bot_vc.is_playing():
         await asyncio.sleep(.2)
 
     try:
